@@ -33,7 +33,10 @@ from flask_login import LoginManager, login_required
 
 from . import __version__ as version
 from . import argument_parser, stats
-from .contrib import fasthttp
+try:
+    from .contrib import fasthttp
+except ImportError:
+    fasthttp = None  # type: ignore[assignment]  # gevent not available (e.g., on z/OS)
 from .html import DEFAULT_BUILD_PATH, get_html_report, render_template_from
 from .log import get_logs
 from .runners import STATE_MISSING, STATE_RUNNING, MasterRunner
@@ -685,7 +688,7 @@ class WebUI:
                 all_http_user_hosts = [
                     user_class.host
                     for user_class in self.environment.runner.user_classes
-                    if issubclass(user_class, HttpUser) or issubclass(user_class, fasthttp.FastHttpUser)
+                    if issubclass(user_class, HttpUser) or (fasthttp and issubclass(user_class, fasthttp.FastHttpUser))
                 ]
                 missing_host_warning = not all(all_http_user_hosts)
         else:
