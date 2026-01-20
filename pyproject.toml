@@ -38,7 +38,6 @@ dependencies = [
     "requests>=2.32.2",
     "msgpack>=1.0.0",
     "pyzmq>=25.0.0",
-    "geventhttpclient>=2.3.1",
     "configargparse>=1.7.1",
     "tomli>=1.1.0; python_version < '3.11'",
     "typing_extensions>=4.6.0; python_version < '3.12'",
@@ -46,7 +45,6 @@ dependencies = [
     "Flask-Login>=0.6.3",
     "Flask-Cors>=3.0.10",
     "pywin32; sys_platform == 'win32'",
-    "gevent>=24.10.1,<26.0.0,!=25.8.1",
     "python-socketio[client]>=5.13.0",
     "python-engineio>=4.12.2",
     "pytest>=8.3.3,<10",
@@ -169,7 +167,7 @@ section-order = [
     "first-party",
     "local-folder",
 ]
-# Custom selection-order: to ensure locust is imported as first in locustfiles (for successful gevent monkey patching)
+# Custom selection-order: to ensure locust is imported first in locustfiles
 
 [tool.ruff.lint.isort.sections]
 locust = ["locust"]
@@ -283,9 +281,4 @@ build = ["sphinx-build -b html docs/ docs/_build/"]
 locust = "pytest_locust.plugin"
 
 [tool.pytest]
-filterwarnings = [
-    # sometimes, monkey patching happens too late 
-    # the proper fix for this is to run python -m gevent.monkey --module pytest ... 
-    # but that isnt always possible
-    "ignore::gevent.monkey.MonkeyPatchWarning",
-]
+filterwarnings = []
