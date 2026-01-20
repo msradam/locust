@@ -616,16 +616,18 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
                 else:
                     logging.warning("Spawning users, can't stop right now")
 
-            listener = input_listener(
-                {
-                    "w": lambda: start_with_count(runner.user_count + 1),
-                    "W": lambda: start_with_count(runner.user_count + 10),
-                    "s": lambda: stop_with_count(max(0, runner.user_count - 1)),
-                    "S": lambda: stop_with_count(max(0, runner.user_count - 10)),
-                    "\r": lambda: webbrowser.open_new_tab(url),
-                    "\n": lambda: webbrowser.open_new_tab(url),
-                },
-            )
+            key_bindings = {
+                "w": lambda: start_with_count(runner.user_count + 1),
+                "W": lambda: start_with_count(runner.user_count + 10),
+                "s": lambda: stop_with_count(max(0, runner.user_count - 1)),
+                "S": lambda: stop_with_count(max(0, runner.user_count - 10)),
+            }
+            # Only add enter key handler when web UI is running (url is defined)
+            if web_ui is not None:
+                key_bindings["\r"] = lambda: webbrowser.open_new_tab(url)
+                key_bindings["\n"] = lambda: webbrowser.open_new_tab(url)
+
+            listener = input_listener(key_bindings)
             # run the input listener in a thread to avoid blocking
             await asyncio.to_thread(listener)
         input_listener_task = main_loop.create_task(input_listener_loop())
