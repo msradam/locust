@@ -21,7 +21,12 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, cast
 from uuid import uuid4
 
-import psutil
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    psutil = None  # type: ignore[assignment]
+    PSUTIL_AVAILABLE = False
 
 from . import argument_parser
 from .dispatch import UsersDispatcher
@@ -288,6 +293,10 @@ class Runner:
         )
 
     async def monitor_cpu_and_memory(self) -> NoReturn:
+        if not PSUTIL_AVAILABLE:
+            # psutil not available (e.g., on z/OS), skip monitoring
+            while True:
+                await asyncio.sleep(CPU_MONITOR_INTERVAL)
         process = psutil.Process()
         while True:
             await asyncio.sleep(CPU_MONITOR_INTERVAL)

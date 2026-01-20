@@ -41,7 +41,7 @@ dependencies = [
     "configargparse>=1.7.1",
     "tomli>=1.1.0; python_version < '3.11'",
     "typing_extensions>=4.6.0; python_version < '3.12'",
-    "psutil>=5.9.1",
+    "psutil>=5.9.1; sys_platform != 'zos'",
     "Flask-Login>=0.6.3",
     "Flask-Cors>=3.0.10",
     "pywin32; sys_platform == 'win32'",
