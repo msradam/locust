@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import itertools
 import json
 import logging
 import mimetypes
 import os.path
+import threading
 from functools import wraps
 from io import StringIO
 from json import dumps
 from typing import TYPE_CHECKING, Any, TypedDict
+from wsgiref.simple_server import make_server, WSGIServer
 
-import gevent
 from flask import (
     Blueprint,
     Flask,
@@ -28,13 +30,12 @@ from flask import (
 )
 from flask_cors import CORS
 from flask_login import LoginManager, login_required
-from gevent import pywsgi
 
 from . import __version__ as version
 from . import argument_parser, stats
 from .contrib import fasthttp
 from .html import DEFAULT_BUILD_PATH, get_html_report, render_template_from
-from .log import get_logs, greenlet_exception_logger
+from .log import get_logs
 from .runners import STATE_MISSING, STATE_RUNNING, MasterRunner
 from .user.inspectuser import get_ratio
 from .user.users import HttpUser
@@ -47,7 +48,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-greenlet_exception_handler = greenlet_exception_logger(logger)
 
 DEFAULT_CACHE_TIME = 2.0
 HOST_IS_REQUIRED = False
@@ -84,6 +84,12 @@ class AuthArgs(TypedDict, total=False):
     info: str
 
 
+class ThreadedWSGIServer(WSGIServer):
+    """Threaded WSGI server to handle requests in separate threads"""
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 class WebUI:
     """
     Sets up and runs a Flask web app that can start and stop load tests using the
@@ -103,13 +109,13 @@ class WebUI:
             return "your IP is: %s" % request.remote_addr
     """
 
-    greenlet: gevent.Greenlet | None = None
+    _server_thread: threading.Thread | None = None
     """
-    Greenlet of the running web server
+    Thread running the web server
     """
 
-    server: pywsgi.WSGIServer | None = None
-    """Reference to the :class:`pyqsgi.WSGIServer` instance"""
+    server: WSGIServer | None = None
+    """Reference to the WSGI server instance"""
 
     template_args: dict[str, Any]
     """Arguments used to render index.html for the web UI. Must be used with custom templates
@@ -159,8 +165,8 @@ class WebUI:
         self.app = app
         app.jinja_env.add_extension("jinja2.ext.do")
         app.debug = True
-        self.greenlet: gevent.Greenlet | None = None
-        self._swarm_greenlet: gevent.Greenlet | None = None
+        self._server_thread: threading.Thread | None = None
+        self._swarm_task: asyncio.Task | None = None
         self.template_args = {}
         self.auth_args = {}
         self.app.template_folder = build_path or DEFAULT_BUILD_PATH
@@ -314,24 +320,25 @@ class WebUI:
                     }
                 )
 
-            if self._swarm_greenlet is not None:
-                self._swarm_greenlet.kill(block=True)
-                self._swarm_greenlet = None
+            if self._swarm_task is not None and not self._swarm_task.done():
+                self._swarm_task.cancel()
+                self._swarm_task = None
 
             if environment.runner is not None:
                 if user_count is None or not spawn_rate:
                     err_msg = "Missing user_count or spawn_rate from /swarm request"
                     logger.error(err_msg)
                     return jsonify({"success": False, "message": err_msg, "host": environment.host})
-                self._swarm_greenlet = gevent.spawn(environment.runner.start, user_count, spawn_rate)
-                self._swarm_greenlet.link_exception(greenlet_exception_handler)
+                # schedule the async start method to run in the event loop
+                loop = asyncio.get_event_loop()
+                self._swarm_task = loop.create_task(environment.runner.start(user_count, spawn_rate))
                 response_data: dict[str, Any] = {
                     "success": True,
                     "message": "Swarming started",
                     "host": environment.host,
                 }
                 if run_time:
-                    gevent.spawn_later(run_time, self._stop_runners).link_exception(greenlet_exception_handler)
+                    loop.call_later(run_time, lambda: loop.create_task(self._stop_runners_async()))
                     response_data["run_time"] = run_time
 
                 if self.userclass_picker_is_active:
@@ -344,11 +351,13 @@ class WebUI:
         @app_blueprint.route("/stop")
         @self.auth_required_if_enabled
         def stop() -> Response:
-            if self._swarm_greenlet is not None:
-                self._swarm_greenlet.kill(block=True)
-                self._swarm_greenlet = None
+            if self._swarm_task is not None and not self._swarm_task.done():
+                self._swarm_task.cancel()
+                self._swarm_task = None
             if environment.runner is not None:
-                environment.runner.stop()
+                # schedule the async stop method to run in the event loop
+                loop = asyncio.get_event_loop()
+                loop.create_task(environment.runner.stop())
             return jsonify({"success": True, "message": "Test stopped"})
 
         @app_blueprint.route("/stats/reset")
@@ -609,25 +618,20 @@ class WebUI:
         self._login_manager = value
 
     def start(self):
-        self.greenlet = gevent.spawn(self.start_server)
-        self.greenlet.link_exception(greenlet_exception_handler)
+        """Start the web server in a background thread"""
+        self._server_thread = threading.Thread(target=self.start_server, daemon=True)
+        self._server_thread.start()
 
     def start_server(self):
         if self.tls_cert and self.tls_key:
-            self.server = pywsgi.WSGIServer(
-                (self.host, self.port), self.app, log=None, keyfile=self.tls_key, certfile=self.tls_cert
-            )
+            # TLS support requires a more capable server
+            import ssl
+            self.server = make_server(self.host, self.port, self.app, server_class=ThreadedWSGIServer)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(self.tls_cert, self.tls_key)
+            self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
         else:
-
-            class RewriteFilter(logging.Filter):
-                def filter(self, record) -> bool:
-                    msg = record.msg
-                    if "gevent._socket3.socket at" in msg and "Invalid HTTP method: '\x16\x03" in msg:
-                        record.msg = f"An https request was made against Locust's Web UI (which was expecting http). Underlying error was: {record.msg}"
-                    return True
-
-            logger.addFilter(RewriteFilter())
-            self.server = pywsgi.WSGIServer((self.host, self.port), self.app, log=None, error_log=logger)
+            self.server = make_server(self.host, self.port, self.app, server_class=ThreadedWSGIServer)
 
         self.server.serve_forever()
 
@@ -778,4 +782,8 @@ class WebUI:
         self.environment._validate_user_class_name_uniqueness()
 
     def _stop_runners(self):
-        self.environment.runner.stop()
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.environment.runner.stop())
+
+    async def _stop_runners_async(self):
+        await self.environment.runner.stop()

@@ -4,9 +4,8 @@ import collections
 import logging
 import os
 import sys
+import time
 from collections.abc import Callable
-
-import gevent
 
 if os.name == "nt":
     import pywintypes
@@ -110,7 +109,7 @@ def input_listener(key_to_func_map: dict[str, Callable]):
                         if input == key:
                             key_to_func_map[key]()
                 else:
-                    gevent.sleep(0.2)
+                    time.sleep(0.2)
         except Exception as e:
             logging.warning(f"Exception in keyboard input poller: {e}")
         finally:

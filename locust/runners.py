@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from locust import __version__
 
+import asyncio
 import functools
 import inspect
 import json
@@ -20,16 +21,12 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, cast
 from uuid import uuid4
 
-import gevent
-import greenlet
 import psutil
-from gevent.event import Event
-from gevent.pool import Group
 
 from . import argument_parser
 from .dispatch import UsersDispatcher
 from .exception import RPCError, RPCReceiveError, RPCSendError, StopTest
-from .log import get_logs, greenlet_exception_logger
+from .log import get_logs
 from .rpc import Message, rpc
 from .stats import RequestStats, StatsError, setup_distributed_stats_event_listeners
 from .util.directory import get_abspaths_in
@@ -64,18 +61,24 @@ CONNECT_RETRY_COUNT = 60
 
 
 def locust_exception_handler(environment: Environment):
-    exception_logger = greenlet_exception_logger(logger)
+    """Exception handler for asyncio tasks"""
 
-    def handler(greenlet):
-        if greenlet.exc_info[0] is StopTest:
-            logger.error(greenlet.exc_info[1])
+    def handler(task: asyncio.Task):
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is None:
+            return
+        if isinstance(exc, StopTest):
+            logger.error(str(exc))
             logger.warning("Stopping Locust...")
             if environment.parsed_options.headless:
                 environment.runner.quit()
             else:
                 environment.runner.stop()
         else:
-            exception_logger(greenlet)
+            logger.critical("Unhandled exception in task: %s", task.get_name(), exc_info=exc)
 
     return handler
 
@@ -100,17 +103,17 @@ class Runner:
 
     def __init__(self, environment: Environment) -> None:
         self.environment = environment
-        self.user_greenlets = Group()
-        self.greenlet = Group()
+        self.user_tasks: dict[User, asyncio.Task] = {}
+        self.background_tasks: list[asyncio.Task] = []
         self.state = STATE_INIT
-        self.spawning_greenlet: gevent.Greenlet | None = None
-        self.shape_greenlet: gevent.Greenlet | None = None
+        self.spawning_task: asyncio.Task | None = None
+        self.shape_task: asyncio.Task | None = None
         self.shape_last_tick: tuple[int, float] | tuple[int, float, list[type[User]] | None] | None = None
         self.current_cpu_usage: float = 0.0
         self.cpu_warning_emitted: bool = False
         self.worker_cpu_warning_emitted: bool = False
         self.current_memory_usage: int = 0
-        self.greenlet.spawn(self.monitor_cpu_and_memory).link_exception(locust_exception_handler(self.environment))
+        self._monitor_task: asyncio.Task | None = None  # started when event loop is running
         self.exceptions: dict[int, ExceptionDict] = {}
         # Because of the way the ramp-up/ramp-down is implemented, target_user_classes_count
         # is only updated at the end of the ramp-up/ramp-down.
@@ -143,9 +146,10 @@ class Runner:
         self.environment.events.spawning_complete.add_listener(on_spawning_complete)
 
     def __del__(self) -> None:
-        # don't leave any stray greenlets if runner is removed
-        if self.greenlet and len(self.greenlet) > 0:
-            self.greenlet.kill(block=False)
+        # cancel any stray tasks if runner is removed
+        for task in self.background_tasks:
+            if not task.done():
+                task.cancel()
 
     @property
     def user_classes(self) -> list[type[User]]:
@@ -168,7 +172,7 @@ class Runner:
         """
         :returns: Number of currently running users
         """
-        return len(self.user_greenlets)
+        return len([t for t in self.user_tasks.values() if not t.done()])
 
     @property
     def user_classes_count(self) -> dict[str, int]:
@@ -176,20 +180,8 @@ class Runner:
         :returns: Number of currently running users for each user class
         """
         user_classes_count = {user_class.__name__: 0 for user_class in self.user_classes}
-        for user_greenlet in self.user_greenlets:
-            try:
-                user = user_greenlet.args[0]
-            except IndexError:
-                # TODO: Find out why args is sometimes empty. In gevent code,
-                #       the supplied args are cleared in the gevent.greenlet.Greenlet.__free,
-                #       so it seems a good place to start investigating. My suspicion is that
-                #       the supplied args are emptied whenever the greenlet is dead, so we can
-                #       simply ignore the greenlets with empty args.
-                logger.debug(
-                    "ERROR: While calculating number of running users, we encountered a user that didn't have proper args %s (user_greenlet.dead=%s)",
-                    user_greenlet,
-                    user_greenlet.dead,
-                )
+        for user, task in self.user_tasks.items():
+            if task.done():
                 continue
             user_classes_count[user.__class__.__name__] += 1
         return user_classes_count
@@ -211,7 +203,7 @@ class Runner:
             )
         return self.cpu_warning_emitted
 
-    def spawn_users(self, user_classes_spawn_count: dict[str, int], wait: bool = False):
+    async def spawn_users(self, user_classes_spawn_count: dict[str, int], wait: bool = False):
         if self.state == STATE_INIT or self.state == STATE_STOPPED:
             self.update_state(STATE_SPAWNING)
 
@@ -219,86 +211,86 @@ class Runner:
             f"Spawning additional {json.dumps(user_classes_spawn_count)} ({json.dumps(self.user_classes_count)} already running)..."
         )
 
-        def spawn(user_class: str, spawn_count: int) -> list[User]:
-            n = 0
-            new_users: list[User] = []
-            while n < spawn_count:
+        new_users: list[User] = []
+        for user_class, spawn_count in user_classes_spawn_count.items():
+            for n in range(spawn_count):
                 new_user = self.user_classes_by_name[user_class](self.environment)
                 assert hasattr(new_user, "environment"), (
                     f"Attribute 'environment' is missing on user {user_class}. Perhaps you defined your own __init__ and forgot to call the base constructor? (super().__init__(*args, **kwargs))"
                 )
-                new_user.start(self.user_greenlets)
+                task = asyncio.create_task(new_user.run())
+                task.add_done_callback(lambda t: self._handle_user_exception(t))
+                self.user_tasks[new_user] = task
+                new_user._task = task
                 new_users.append(new_user)
-                n += 1
-                if n % 10 == 0 or n == spawn_count:
+                if (n + 1) % 10 == 0 or (n + 1) == spawn_count:
                     logger.debug("%i users spawned" % self.user_count)
             logger.debug(f"All users of class {user_class} spawned")
-            return new_users
-
-        new_users: list[User] = []
-        for user_class, spawn_count in user_classes_spawn_count.items():
-            new_users += spawn(user_class, spawn_count)
 
         if wait:
-            self.user_greenlets.join()
+            await asyncio.gather(*[self.user_tasks[u] for u in new_users], return_exceptions=True)
             logger.info("All users stopped\n")
         return new_users
 
-    def stop_users(self, user_classes_stop_count: dict[str, int]) -> None:
-        async_calls_to_stop = Group()
-        stop_group = Group()
+    def _handle_user_exception(self, task: asyncio.Task):
+        """Callback for user task completion"""
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error("User task failed: %s", e)
+
+    async def stop_users(self, user_classes_stop_count: dict[str, int]) -> None:
+        tasks_to_stop: list[asyncio.Task] = []
 
         for user_class, stop_count in user_classes_stop_count.items():
-            if self.user_classes_count[user_class] == 0:
+            if self.user_classes_count.get(user_class, 0) == 0:
                 continue
 
-            to_stop: list[greenlet.greenlet] = []
-            for user_greenlet in self.user_greenlets:
+            to_stop: list[User] = []
+            for user, task in self.user_tasks.items():
                 if len(to_stop) == stop_count:
                     break
-                try:
-                    user = user_greenlet.args[0]
-                except IndexError:
-                    logger.error(
-                        "While stopping users, we encountered a user that didn't have proper args %s", user_greenlet
-                    )
+                if task.done():
                     continue
                 if type(user) is self.user_classes_by_name[user_class]:
                     to_stop.append(user)
 
-            if not to_stop:
-                continue
-
-            while True:
-                user_to_stop: User = to_stop.pop()
-                logger.debug(f"Stopping {user_to_stop.greenlet.name}")
-                if user_to_stop.greenlet is greenlet.getcurrent():
-                    # User called runner.quit(), so don't block waiting for killing to finish
-                    user_to_stop.group.killone(user_to_stop.greenlet, block=False)
-                elif self.environment.stop_timeout:
-                    async_calls_to_stop.add(gevent.spawn_later(0, user_to_stop.stop, force=False))
-                    stop_group.add(user_to_stop.greenlet)
+            for user_to_stop in to_stop:
+                task = self.user_tasks.get(user_to_stop)
+                if task is None or task.done():
+                    continue
+                logger.debug(f"Stopping user {user_to_stop}")
+                if self.environment.stop_timeout:
+                    user_to_stop.stop(force=False)
+                    tasks_to_stop.append(task)
                 else:
-                    async_calls_to_stop.add(gevent.spawn_later(0, user_to_stop.stop, force=True))
-                if not to_stop:
-                    break
+                    user_to_stop.stop(force=True)
 
-        async_calls_to_stop.join()
-
-        if not stop_group.join(timeout=self.environment.stop_timeout):
-            logger.info(
-                f"Not all users finished their tasks & terminated in {self.environment.stop_timeout} seconds. Stopping them..."
-            )
-            stop_group.kill(block=True)
+        if tasks_to_stop and self.environment.stop_timeout:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks_to_stop, return_exceptions=True),
+                    timeout=self.environment.stop_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.info(
+                    f"Not all users finished their tasks & terminated in {self.environment.stop_timeout} seconds. Stopping them..."
+                )
+                for task in tasks_to_stop:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks_to_stop, return_exceptions=True)
 
         logger.debug(
             "%g users have been stopped, %g still running", sum(user_classes_stop_count.values()), self.user_count
         )
 
-    def monitor_cpu_and_memory(self) -> NoReturn:
+    async def monitor_cpu_and_memory(self) -> NoReturn:
         process = psutil.Process()
         while True:
-            gevent.sleep(CPU_MONITOR_INTERVAL)
+            await asyncio.sleep(CPU_MONITOR_INTERVAL)
             self.current_cpu_usage = process.cpu_percent()
             self.current_memory_usage = process.memory_info().rss
             if self.current_cpu_usage > CPU_WARNING_THRESHOLD:
@@ -314,7 +306,7 @@ class Runner:
             )
 
     @abstractmethod
-    def start(
+    async def start(
         self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list[type[User]] | None = None
     ) -> None: ...
 
@@ -325,18 +317,18 @@ class Runner:
         """
         Start running a load test with a custom LoadTestShape specified in the :meth:`Environment.shape_class <locust.env.Environment.shape_class>` parameter.
         """
-        if self.shape_greenlet:
+        if self.shape_task and not self.shape_task.done():
             logger.info("There is an ongoing shape test running. Editing is disabled")
             return
 
         logger.info("Shape test starting.")
         self.update_state(STATE_INIT)
-        self.shape_greenlet = self.greenlet.spawn(self.shape_worker)
-        self.shape_greenlet.link_exception(locust_exception_handler(self.environment))
+        self.shape_task = asyncio.create_task(self.shape_worker())
+        self.shape_task.add_done_callback(locust_exception_handler(self.environment))
         if self.environment.shape_class is not None:
             self.environment.shape_class.reset_time()
 
-    def shape_worker(self) -> None:
+    async def shape_worker(self) -> None:
         logger.info("Shape worker starting")
         while self.state == STATE_INIT or self.state == STATE_SPAWNING or self.state == STATE_RUNNING:
             shape_adjustment_start = time.time()
@@ -346,8 +338,8 @@ class Runner:
                 if self.environment.parsed_options and self.environment.parsed_options.headless:
                     self.quit()
                 else:
-                    self.stop()
-                self.shape_greenlet = None
+                    await self.stop()
+                self.shape_task = None
                 self.shape_last_tick = None
                 return
             elif self.shape_last_tick != current_tick:
@@ -357,25 +349,12 @@ class Runner:
                 else:
                     user_count, spawn_rate, user_classes = current_tick
                 logger.info("Shape test updating to %d users at %.2f spawn rate" % (user_count, spawn_rate))
-                # TODO: This `self.start()` call is blocking until the ramp-up is completed. This can leads
-                #       to unexpected behaviours such as the one in the following example:
-                #       A load test shape has the following stages:
-                #           stage 1: (user_count=100, spawn_rate=1) for t < 50s
-                #           stage 2: (user_count=120, spawn_rate=1) for t < 100s
-                #           stage 3: (user_count=130, spawn_rate=1) for t < 120s
-                #        Because the first stage will take 100s to complete, the second stage
-                #        will be skipped completely because the shape worker will be blocked
-                #        at the `self.start()` of the first stage.
-                #        Of course, this isn't a problem if the load test shape is well-defined.
-                #        We should probably use a `gevent.timeout` with a duration a little over
-                #        `(user_count - prev_user_count) / spawn_rate` in order to limit the runtime
-                #        of each load test shape stage.
-                self.start(user_count=user_count, spawn_rate=spawn_rate, user_classes=user_classes)
+                await self.start(user_count=user_count, spawn_rate=spawn_rate, user_classes=user_classes)
                 self.shape_last_tick = current_tick
             shape_adjustment_time_ms = time.time() - shape_adjustment_start
-            gevent.sleep(max(1 - shape_adjustment_time_ms, 0))
+            await asyncio.sleep(max(1 - shape_adjustment_time_ms, 0))
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         """
         Stop a running load test by stopping all running users
         """
@@ -390,19 +369,27 @@ class Runner:
         self.final_user_classes_count = {**self.user_classes_count}
         self.update_state(STATE_CLEANUP)
 
-        # if we are currently spawning users we need to kill the spawning greenlet first
-        if self.spawning_greenlet and not self.spawning_greenlet.ready():
-            self.spawning_greenlet.kill(block=True)
+        # if we are currently spawning users we need to cancel the spawning task first
+        if self.spawning_task and not self.spawning_task.done():
+            self.spawning_task.cancel()
+            try:
+                await self.spawning_task
+            except asyncio.CancelledError:
+                pass
 
-        if self.environment.shape_class is not None and self.shape_greenlet is not greenlet.getcurrent():
+        if self.environment.shape_class is not None:
             # If the test was not started yet and locust is
-            # stopped/quit, shape_greenlet will be None.
-            if self.shape_greenlet is not None:
-                self.shape_greenlet.kill(block=True)
-                self.shape_greenlet = None
+            # stopped/quit, shape_task will be None.
+            if self.shape_task is not None and not self.shape_task.done():
+                self.shape_task.cancel()
+                try:
+                    await self.shape_task
+                except asyncio.CancelledError:
+                    pass
+                self.shape_task = None
             self.shape_last_tick = None
 
-        self.stop_users(self.user_classes_count)
+        await self.stop_users(self.user_classes_count)
 
         self._users_dispatcher = None
 
@@ -413,10 +400,27 @@ class Runner:
 
     def quit(self) -> None:
         """
-        Stop any running load test and kill all greenlets for the runner
+        Stop any running load test and cancel all tasks for the runner
         """
-        self.stop()
-        self.greenlet.kill(block=True)
+        # schedule the async stop and task cancellation
+        asyncio.create_task(self._quit_async())
+
+    async def _quit_async(self) -> None:
+        """Async implementation of quit"""
+        await self.stop()
+        # cancel all background tasks
+        for task in self.background_tasks:
+            if not task.done():
+                task.cancel()
+        if self.background_tasks:
+            await asyncio.gather(*self.background_tasks, return_exceptions=True)
+        # cancel monitor task
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
 
     def log_exception(self, node_id: str, msg: str, formatted_tb: str) -> None:
         key = hash(formatted_tb)
@@ -463,14 +467,14 @@ class LocalRunner(Runner):
 
         self.environment.events.user_error.add_listener(on_user_error)
 
-    def _start(self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list | None = None) -> None:
+    async def _start(self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list | None = None) -> None:
         """
         Start running a load test
 
         :param user_count: Total number of users to start
         :param spawn_rate: Number of users to spawn per second
         :param wait: If True calls to this method will block until all users are spawned.
-                     If False (the default), a greenlet that spawns the users will be
+                     If False (the default), a task that spawns the users will be
                      started and the call to this method will return immediately.
         :param user_classes: The user classes to be dispatched, None indicates to use the classes the dispatcher was
                              invoked with.
@@ -522,20 +526,19 @@ class LocalRunner(Runner):
 
                 if wait:
                     # spawn_users will block, so we need to call stop_users first
-                    self.stop_users(user_classes_stop_count)
-                    self.spawn_users(user_classes_spawn_count, wait)
+                    await self.stop_users(user_classes_stop_count)
+                    await self.spawn_users(user_classes_spawn_count, wait)
                 else:
                     # call spawn_users before stopping the users since stop_users
                     # can be blocking because of the stop_timeout
-                    self.spawn_users(user_classes_spawn_count, wait)
-                    self.stop_users(user_classes_stop_count)
+                    await self.spawn_users(user_classes_spawn_count, wait)
+                    await self.stop_users(user_classes_stop_count)
 
                 self._local_worker_node.user_classes_count = next(iter(dispatched_users.values()))
 
         except KeyboardInterrupt:
-            # TODO: Find a cleaner way to handle that
             # We need to catch keyboard interrupt. Otherwise, if KeyboardInterrupt is received while in
-            # a gevent.sleep inside the dispatch_users function, locust won't gracefully shutdown.
+            # an asyncio.sleep inside the dispatch_users function, locust won't gracefully shutdown.
             self.quit()
 
         logger.info(f"All users spawned: {_format_user_classes_count_for_log(self.user_classes_count)}")
@@ -544,7 +547,7 @@ class LocalRunner(Runner):
 
         self.environment.events.spawning_complete.fire(user_count=sum(self.target_user_classes_count.values()))
 
-    def start(
+    async def start(
         self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list[type[User]] | None = None
     ) -> None:
         if spawn_rate > 100:
@@ -552,18 +555,22 @@ class LocalRunner(Runner):
                 "Your selected spawn rate is very high (>100), and this is known to sometimes cause issues. Do you really need to ramp up that fast?"
             )
 
-        if self.spawning_greenlet:
-            # kill existing spawning_greenlet before we start a new one
-            self.spawning_greenlet.kill(block=True)
-        self.spawning_greenlet = self.greenlet.spawn(
-            lambda: self._start(user_count, spawn_rate, wait=wait, user_classes=user_classes)
+        if self.spawning_task and not self.spawning_task.done():
+            # cancel existing spawning_task before we start a new one
+            self.spawning_task.cancel()
+            try:
+                await self.spawning_task
+            except asyncio.CancelledError:
+                pass
+        self.spawning_task = asyncio.create_task(
+            self._start(user_count, spawn_rate, wait=wait, user_classes=user_classes)
         )
-        self.spawning_greenlet.link_exception(locust_exception_handler(self.environment))
+        self.spawning_task.add_done_callback(locust_exception_handler(self.environment))
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         if self.state == STATE_STOPPED:
             return
-        super().stop()
+        await super().stop()
 
     def send_message(self, msg_type: str, data: Any = None, client_id: str | None = None) -> None:
         """
@@ -650,9 +657,9 @@ class MasterRunner(DistributedRunner):
     """
     Runner used to run distributed load tests across multiple processes and/or machines.
 
-    MasterRunner doesn't spawn any user greenlets itself. Instead it expects
+    MasterRunner doesn't spawn any user tasks itself. Instead it expects
     :class:`WorkerRunners <WorkerRunner>` to connect to it, which it will then direct
-    to start and stop user greenlets. Stats sent back from the
+    to start and stop user tasks. Stats sent back from the
     :class:`WorkerRunners <WorkerRunner>` will aggregated.
     """
 
@@ -670,6 +677,8 @@ class MasterRunner(DistributedRunner):
         self.spawning_completed = False
         self.worker_indexes: dict[str, int] = {}
         self.worker_index_max = 0
+        self._heartbeat_task: asyncio.Task | None = None
+        self._client_listener_task: asyncio.Task | None = None
 
         self.clients = WorkerNodes()
         try:
@@ -688,8 +697,8 @@ class MasterRunner(DistributedRunner):
 
         self._users_dispatcher: UsersDispatcher | None = None
 
-        self.greenlet.spawn(self.heartbeat_worker).link_exception(locust_exception_handler(self.environment))
-        self.greenlet.spawn(self.client_listener).link_exception(locust_exception_handler(self.environment))
+        # background tasks will be started when the event loop is running
+        # they are created in start_background_tasks() called from main
 
         # listener that gathers info on how many users the worker has spawned
         def on_worker_report(client_id: str, data: dict[str, Any]) -> None:
@@ -735,7 +744,15 @@ class MasterRunner(DistributedRunner):
             warning_emitted = True
         return warning_emitted
 
-    def start(
+    def start_background_tasks(self) -> None:
+        """Start the heartbeat and client listener background tasks.
+        Called when the event loop is running."""
+        self._heartbeat_task = asyncio.create_task(self.heartbeat_worker())
+        self._heartbeat_task.add_done_callback(locust_exception_handler(self.environment))
+        self._client_listener_task = asyncio.create_task(self.client_listener())
+        self._client_listener_task.add_done_callback(locust_exception_handler(self.environment))
+
+    async def start(
         self, user_count: int, spawn_rate: float, wait=False, user_classes: list[type[User]] | None = None
     ) -> None:
         self.spawning_completed = False
@@ -785,7 +802,8 @@ class MasterRunner(DistributedRunner):
 
         try:
             for dispatched_users in self._users_dispatcher:
-                dispatch_greenlets = Group()
+                # send spawn messages to all workers concurrently
+                send_tasks = []
                 for worker_node_id, worker_user_classes_count in dispatched_users.items():
                     data = {
                         "timestamp": time.time(),
@@ -796,20 +814,22 @@ class MasterRunner(DistributedRunner):
                         if self.environment.parsed_options
                         else {},
                     }
-                    dispatch_greenlets.add(
-                        gevent.spawn_later(
-                            0,
-                            self.server.send_to_client,
-                            Message("spawn", data, worker_node_id),
+                    # run send in thread pool since RPC may block
+                    send_tasks.append(
+                        asyncio.create_task(
+                            asyncio.to_thread(
+                                self.server.send_to_client,
+                                Message("spawn", data, worker_node_id),
+                            )
                         )
                     )
                 dispatched_user_count = sum(map(sum, map(methodcaller("values"), dispatched_users.values())))
                 logger.debug(
                     "Sending spawn messages for %g total users to %i worker(s)",
                     dispatched_user_count,
-                    len(dispatch_greenlets),
+                    len(send_tasks),
                 )
-                dispatch_greenlets.join()
+                await asyncio.gather(*send_tasks)
 
                 logger.debug(
                     f"Currently spawned users: {_format_user_classes_count_for_log(self.reported_user_classes_count)}"
@@ -818,26 +838,26 @@ class MasterRunner(DistributedRunner):
             self.target_user_classes_count = _aggregate_dispatched_users(dispatched_users)
 
         except KeyboardInterrupt:
-            # TODO: Find a cleaner way to handle that
             # We need to catch keyboard interrupt. Otherwise, if KeyboardInterrupt is received while in
-            # a gevent.sleep inside the dispatch_users function, locust won't gracefully shutdown.
+            # an asyncio.sleep inside the dispatch_users function, locust won't gracefully shutdown.
             self.quit()
 
         # Wait a little for workers to report their users to the master
         # so that we can give an accurate log message below and fire the `spawning_complete` event
         # when the user count is really at the desired value.
-        timeout = gevent.Timeout(self._wait_for_workers_report_after_ramp_up())
-        timeout.start()
+        wait_timeout = self._wait_for_workers_report_after_ramp_up()
         msg_prefix = "All users spawned"
         try:
+            start_time = time.time()
             while self.user_count != self.target_user_count:
-                gevent.sleep(0.01)
-        except gevent.Timeout:
-            msg_prefix = (
-                "Spawning is complete and report waittime is expired, but not all reports received from workers"
-            )
-        finally:
-            timeout.cancel()
+                if time.time() - start_time > wait_timeout:
+                    msg_prefix = (
+                        "Spawning is complete and report waittime is expired, but not all reports received from workers"
+                    )
+                    break
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            raise
 
         user_count = sum(self.target_user_classes_count.values())
         self.environment.events.spawning_complete.fire(user_count=user_count)
@@ -871,20 +891,21 @@ class MasterRunner(DistributedRunner):
         else:
             return float(match.group("coeff")) * WORKER_REPORT_INTERVAL
 
-    def stop(self, send_stop_to_client: bool = True) -> None:
+    async def stop(self, send_stop_to_client: bool = True) -> None:
         if self.state not in [STATE_INIT, STATE_STOPPED, STATE_STOPPING]:
             logger.debug("Stopping...")
             self.environment.events.test_stopping.fire(environment=self.environment)
             self.final_user_classes_count = {**self.reported_user_classes_count}
             self.update_state(STATE_STOPPING)
 
-            if (
-                self.environment.shape_class is not None
-                and self.shape_greenlet is not None
-                and self.shape_greenlet is not greenlet.getcurrent()
-            ):
-                self.shape_greenlet.kill(block=True)
-                self.shape_greenlet = None
+            if self.environment.shape_class is not None and self.shape_task is not None:
+                if not self.shape_task.done():
+                    self.shape_task.cancel()
+                    try:
+                        await self.shape_task
+                    except asyncio.CancelledError:
+                        pass
+                self.shape_task = None
                 self.shape_last_tick = None
 
             self._users_dispatcher = None
@@ -892,28 +913,33 @@ class MasterRunner(DistributedRunner):
             if send_stop_to_client:
                 for client in self.clients.all:
                     logger.debug(f"Sending stop message to worker {client.id}")
-                    self.server.send_to_client(Message("stop", None, client.id))
+                    await asyncio.to_thread(self.server.send_to_client, Message("stop", None, client.id))
 
                 # Give an additional 60s for all workers to stop
-                timeout = gevent.Timeout(self.environment.stop_timeout + 60)
-                timeout.start()
-                try:
-                    while self.user_count != 0:
-                        gevent.sleep(1)
-                except gevent.Timeout:
-                    logger.error("Timeout waiting for all workers to stop")
-                finally:
-                    timeout.cancel()
+                stop_timeout = (self.environment.stop_timeout or 0) + 60
+                start_time = time.time()
+                while self.user_count != 0:
+                    if time.time() - start_time > stop_timeout:
+                        logger.error("Timeout waiting for all workers to stop")
+                        break
+                    await asyncio.sleep(1)
             self.environment.events.test_stop.fire(environment=self.environment)
 
     def quit(self) -> None:
-        self.stop(send_stop_to_client=False)
+        asyncio.create_task(self._quit_async())
+
+    async def _quit_async(self) -> None:
+        await self.stop(send_stop_to_client=False)
         logger.debug("Quitting...")
         for client in self.clients.all:
             logger.debug(f"Sending quit message to worker {client.id} (index {self.get_worker_index(client.id)})")
-            self.server.send_to_client(Message("quit", None, client.id))
-        gevent.sleep(0.5)  # wait for final stats report from all workers
-        self.greenlet.kill(block=True)
+            await asyncio.to_thread(self.server.send_to_client, Message("quit", None, client.id))
+        await asyncio.sleep(0.5)  # wait for final stats report from all workers
+        # cancel background tasks
+        if self._heartbeat_task and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+        if self._client_listener_task and not self._client_listener_task.done():
+            self._client_listener_task.cancel()
 
     def check_stopped(self) -> None:
         if (
@@ -923,11 +949,11 @@ class MasterRunner(DistributedRunner):
         ):
             self.update_state(STATE_STOPPED)
 
-    def heartbeat_worker(self) -> NoReturn:
+    async def heartbeat_worker(self) -> NoReturn:
         while True:
-            gevent.sleep(HEARTBEAT_INTERVAL)
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
             if self.connection_broken:
-                self.reset_connection()
+                await asyncio.to_thread(self.reset_connection)
                 continue
 
             missing_clients_to_be_removed = []
@@ -943,10 +969,10 @@ class MasterRunner(DistributedRunner):
                     if self._users_dispatcher is not None:
                         self._users_dispatcher.remove_worker(client)
                         if self.rebalancing_enabled() and self.state == STATE_RUNNING and self.spawning_completed:
-                            self.start(self.target_user_count, self.spawn_rate)
+                            await self.start(self.target_user_count, self.spawn_rate)
                     if self.worker_count <= 0:
                         logger.info("The last worker went missing, stopping test.")
-                        self.stop()
+                        await self.stop()
                         self.check_stopped()
                 else:
                     client.heartbeat -= 1
@@ -959,8 +985,8 @@ class MasterRunner(DistributedRunner):
                 if self.state == STATE_RUNNING or self.state == STATE_SPAWNING:
                     # _users_dispatcher is set to none so that during redistribution the dead clients are not picked, alternative is to call self.stop() before start
                     self._users_dispatcher = None
-                    # trigger redistribution after missing cclient removal
-                    self.start(user_count=self.target_user_count, spawn_rate=self.spawn_rate)
+                    # trigger redistribution after missing client removal
+                    await self.start(user_count=self.target_user_count, spawn_rate=self.spawn_rate)
 
     def reset_connection(self) -> None:
         logger.info("Resetting RPC server and all worker connections.")
@@ -971,21 +997,22 @@ class MasterRunner(DistributedRunner):
         except RPCError as e:
             logger.error(f"Temporary failure when resetting connection: {e}, will retry later.")
 
-    def client_listener(self) -> NoReturn:
+    async def client_listener(self) -> NoReturn:
         while True:
             try:
-                client_id, msg = self.server.recv_from_client()
+                # run blocking RPC receive in thread pool
+                client_id, msg = await asyncio.to_thread(self.server.recv_from_client)
             except RPCReceiveError as e:
                 client_id = e.addr
 
                 if client_id and client_id in self.clients:
                     logger.error(f"RPCError when receiving from client: {e}. Will reset client {client_id}.")
                     try:
-                        self.server.send_to_client(Message("reconnect", None, client_id))
+                        await asyncio.to_thread(self.server.send_to_client, Message("reconnect", None, client_id))
                     except Exception as error:
                         logger.error(f"Error sending reconnect message to worker: {error}. Will reset RPC server.")
                         self.connection_broken = True
-                        gevent.sleep(FALLBACK_INTERVAL)
+                        await asyncio.sleep(FALLBACK_INTERVAL)
                         continue
                 else:
                     message = f"{e}" if not client_id else f"{e} from {client_id}"
@@ -994,7 +1021,7 @@ class MasterRunner(DistributedRunner):
             except RPCSendError as e:
                 logger.error(f"Error sending reconnect message to worker: {e}. Will reset RPC server.")
                 self.connection_broken = True
-                gevent.sleep(FALLBACK_INTERVAL)
+                await asyncio.sleep(FALLBACK_INTERVAL)
                 continue
             except RPCError as e:
                 if self.clients.ready or self.clients.spawning or self.clients.running:
@@ -1004,15 +1031,15 @@ class MasterRunner(DistributedRunner):
                         f"RPCError when receiving from worker: {e} (but no workers were expected to be connected anyway)"
                     )
                 self.connection_broken = True
-                gevent.sleep(FALLBACK_INTERVAL)
+                await asyncio.sleep(FALLBACK_INTERVAL)
                 continue
             except KeyboardInterrupt:
                 logging.debug(
-                    "Got KeyboardInterrupt in client_listener. Other greenlets should catch this and shut down."
+                    "Got KeyboardInterrupt in client_listener. Other tasks should catch this and shut down."
                 )
-            self.handle_message(client_id, msg)
+            await self.handle_message(client_id, msg)
 
-    def handle_message(self, client_id: str, msg: Message) -> None:
+    async def handle_message(self, client_id: str, msg: Message) -> None:
         match msg.type:
             case "client_ready":
                 if not msg.data:
@@ -1035,7 +1062,7 @@ class MasterRunner(DistributedRunner):
                     self._users_dispatcher.add_worker(worker_node=self.clients[client_id])
                     if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
                         # TODO: Test this situation
-                        self.start(self.target_user_count, self.spawn_rate)
+                        await self.start(self.target_user_count, self.spawn_rate)
                 if client_already_connected:
                     logger.debug(
                         f"{client_id} (index {self.get_worker_index(client_id)}) reported as ready (duplicate message). {len(self.clients.ready + self.clients.running + self.clients.spawning)} workers connected."
@@ -1045,7 +1072,7 @@ class MasterRunner(DistributedRunner):
                         f"{client_id} (index {self.get_worker_index(client_id)}) reported as ready. {len(self.clients.ready + self.clients.running + self.clients.spawning)} workers connected."
                     )
                 if self.rebalancing_enabled() and self.state == STATE_RUNNING and self.spawning_completed:
-                    self.start(self.target_user_count, self.spawn_rate)
+                    await self.start(self.target_user_count, self.spawn_rate)
                 # emit a warning if the worker's clock seem to be out of sync with our clock
                 # if abs(time() - msg.data["time"]) > 5.0:
                 #    warnings.warn("The worker node's clock seem to be out of sync. For the statistics to be correct the different locust servers need to have synchronized clocks.")
@@ -1103,7 +1130,7 @@ class MasterRunner(DistributedRunner):
                     self._users_dispatcher.remove_worker(client)
                     if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
                         # TODO: Test this situation
-                        self.start(self.target_user_count, self.spawn_rate)
+                        await self.start(self.target_user_count, self.spawn_rate)
                 logger.info(f"{msg.node_id} (index {self.get_worker_index(client_id)}) reported that it has stopped")
             case "heartbeat":
                 if msg.node_id in self.clients:
@@ -1116,7 +1143,7 @@ class MasterRunner(DistributedRunner):
                             self._users_dispatcher.add_worker(worker_node=c)
                             if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
                                 # TODO: Test this situation
-                                self.start(self.target_user_count, self.spawn_rate)
+                                await self.start(self.target_user_count, self.spawn_rate)
                     c.state = client_state
                     c.cpu_usage = msg.data["current_cpu_usage"]
                     if not c.cpu_warning_emitted and c.cpu_usage > 90:
@@ -1128,7 +1155,7 @@ class MasterRunner(DistributedRunner):
                     if "current_memory_usage" in msg.data:
                         c.memory_usage = msg.data["current_memory_usage"]
                     self.environment.events.heartbeat_sent.fire(client_id=msg.node_id, timestamp=time.time())
-                    self.server.send_to_client(Message("heartbeat", None, msg.node_id))
+                    await asyncio.to_thread(self.server.send_to_client, Message("heartbeat", None, msg.node_id))
                 else:
                     logging.debug(f"Got heartbeat message from unknown worker {msg.node_id}")
             case "stats":
@@ -1138,7 +1165,7 @@ class MasterRunner(DistributedRunner):
                     self.clients[msg.node_id].state = STATE_SPAWNING
                 except KeyError:
                     logger.warning(f"Got spawning message from unknown worker {msg.node_id}. Asking worker to quit.")
-                    self.server.send_to_client(Message("quit", None, msg.node_id))
+                    await asyncio.to_thread(self.server.send_to_client, Message("quit", None, msg.node_id))
             case "spawning_complete":
                 # a worker finished spawning (this happens multiple times during rampup)
                 self.clients[msg.node_id].state = STATE_RUNNING
@@ -1153,13 +1180,13 @@ class MasterRunner(DistributedRunner):
                         self._users_dispatcher.remove_worker(client)
                         if not self._users_dispatcher.dispatch_in_progress and self.state == STATE_RUNNING:
                             # TODO: Test this situation
-                            self.start(self.target_user_count, self.spawn_rate)
+                            await self.start(self.target_user_count, self.spawn_rate)
                     logger.info(
                         f"Worker {msg.node_id!r} (index {self.get_worker_index(msg.node_id)}) quit. {len(self.clients.ready)} workers ready."
                     )
                     if self.worker_count - len(self.clients.missing) <= 0:
                         logger.info("The last worker quit, stopping test.")
-                        self.stop()
+                        await self.stop()
                         if self.environment.parsed_options and self.environment.parsed_options.headless:
                             self.quit()
             case "exception":
@@ -1173,7 +1200,7 @@ class MasterRunner(DistributedRunner):
                     if not concurrent:
                         listener(environment=self.environment, msg=msg)
                     else:
-                        gevent.spawn(listener, environment=self.environment, msg=msg)
+                        asyncio.create_task(asyncio.to_thread(listener, environment=self.environment, msg=msg))
                 except Exception:
                     logging.error(f"Uncaught exception in handler for {msg.type}\n{traceback.format_exc()}")
             case _:
@@ -1218,7 +1245,7 @@ class WorkerRunner(DistributedRunner):
     Runner used to run distributed load tests across multiple processes and/or machines.
 
     WorkerRunner connects to a :class:`MasterRunner` from which it'll receive
-    instructions to start and stop user greenlets. The WorkerRunner will periodically
+    instructions to start and stop user tasks. The WorkerRunner will periodically
     take the stats generated by the running users and send back to the :class:`MasterRunner`.
     """
 
@@ -1235,7 +1262,7 @@ class WorkerRunner(DistributedRunner):
         self.retry = 0
         self.connected = False
         self.last_heartbeat_timestamp: float | None = None
-        self.connection_event = Event()
+        self.connection_event = asyncio.Event()
         self.worker_state = STATE_INIT
         self.client_id = socket.gethostname() + "_" + uuid4().hex
         self.master_host = master_host
@@ -1245,12 +1272,12 @@ class WorkerRunner(DistributedRunner):
         self.worker_cpu_warning_emitted = False
         self._users_dispatcher: UsersDispatcher | None = None
         self.client = rpc.Client(master_host, master_port, self.client_id)
-        self.greenlet.spawn(self.worker).link_exception(locust_exception_handler(self.environment))
-        self.connect_to_master()
-        self.greenlet.spawn(self.heartbeat).link_exception(locust_exception_handler(self.environment))
-        self.greenlet.spawn(self.heartbeat_timeout_checker).link_exception(locust_exception_handler(self.environment))
-        self.greenlet.spawn(self.stats_reporter).link_exception(locust_exception_handler(self.environment))
-        self.greenlet.spawn(self.logs_reporter).link_exception(locust_exception_handler(self.environment))
+        # background tasks - will be started when the event loop is running
+        self._worker_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
+        self._heartbeat_timeout_task: asyncio.Task | None = None
+        self._stats_reporter_task: asyncio.Task | None = None
+        self._logs_reporter_task: asyncio.Task | None = None
 
         # register listener that adds the current number of spawned users to the report that is sent to the master node
         def on_report_to_master(client_id: str, data: dict[str, Any]):
@@ -1272,6 +1299,41 @@ class WorkerRunner(DistributedRunner):
 
         self.environment.events.user_error.add_listener(on_user_error)
 
+    def start_background_tasks(self) -> None:
+        """Start background tasks for worker. Called when event loop is running."""
+        self._worker_task = asyncio.create_task(self.worker())
+        self._worker_task.add_done_callback(locust_exception_handler(self.environment))
+        self._heartbeat_task = asyncio.create_task(self.heartbeat())
+        self._heartbeat_task.add_done_callback(locust_exception_handler(self.environment))
+        self._heartbeat_timeout_task = asyncio.create_task(self.heartbeat_timeout_checker())
+        self._heartbeat_timeout_task.add_done_callback(locust_exception_handler(self.environment))
+        self._stats_reporter_task = asyncio.create_task(self.stats_reporter())
+        self._stats_reporter_task.add_done_callback(locust_exception_handler(self.environment))
+        self._logs_reporter_task = asyncio.create_task(self.logs_reporter())
+        self._logs_reporter_task.add_done_callback(locust_exception_handler(self.environment))
+
+    async def connect_to_master_async(self) -> None:
+        """Async version of connect_to_master"""
+        self.retry += 1
+        await asyncio.to_thread(self.client.send, Message("client_ready", __version__, self.client_id))
+        try:
+            await asyncio.wait_for(self.connection_event.wait(), timeout=CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            if self.retry < 30 / CONNECT_TIMEOUT:  # lower log level during the first 30 seconds
+                logger.debug(
+                    f"Failed to connect to master {self.master_host}:{self.master_port}{self.web_base_path}, retry {self.retry}/{CONNECT_RETRY_COUNT}."
+                )
+            else:
+                logger.info(
+                    f"Failed to connect to master {self.master_host}:{self.master_port}{self.web_base_path}, retry {self.retry}/{CONNECT_RETRY_COUNT}."
+                )
+            if self.retry > CONNECT_RETRY_COUNT:
+                raise ConnectionError()
+            await self.connect_to_master_async()
+        except asyncio.CancelledError:
+            sys.exit(1)
+        self.connected = True
+
     def spawning_complete(self, user_count):
         assert user_count == sum(self.user_classes_count.values())
         self.client.send(
@@ -1283,12 +1345,12 @@ class WorkerRunner(DistributedRunner):
         )
         self.worker_state = STATE_RUNNING
 
-    def start(
+    async def start(
         self, user_count: int, spawn_rate: float, wait: bool = False, user_classes: list[type[User]] | None = None
     ) -> None:
         raise NotImplementedError("use start_worker")
 
-    def start_worker(self, user_classes_count: dict[str, int], **kwargs) -> None:
+    async def start_worker(self, user_classes_count: dict[str, int], **kwargs) -> None:
         """
         Start running a load test as a worker
 
@@ -1312,16 +1374,17 @@ class WorkerRunner(DistributedRunner):
 
         # call spawn_users before stopping the users since stop_users
         # can be blocking because of the stop_timeout
-        self.spawn_users(user_classes_spawn_count)
-        self.stop_users(user_classes_stop_count)
-        self.spawning_complete(sum(self.user_classes_count.values()))
+        await self.spawn_users(user_classes_spawn_count)
+        await self.stop_users(user_classes_stop_count)
+        await asyncio.to_thread(self.spawning_complete, sum(self.user_classes_count.values()))
         self.update_state(STATE_RUNNING)
         self.worker_state = STATE_RUNNING
 
-    def heartbeat(self) -> NoReturn:
+    async def heartbeat(self) -> NoReturn:
         while True:
             try:
-                self.client.send(
+                await asyncio.to_thread(
+                    self.client.send,
                     Message(
                         "heartbeat",
                         {
@@ -1334,12 +1397,12 @@ class WorkerRunner(DistributedRunner):
                 )
             except RPCError as e:
                 logger.error(f"RPCError found when sending heartbeat: {e}")
-                self.reset_connection()
-            gevent.sleep(HEARTBEAT_INTERVAL)
+                await asyncio.to_thread(self.reset_connection)
+            await asyncio.sleep(HEARTBEAT_INTERVAL)
 
-    def heartbeat_timeout_checker(self) -> NoReturn:
+    async def heartbeat_timeout_checker(self) -> NoReturn:
         while True:
-            gevent.sleep(1)
+            await asyncio.sleep(1)
             if self.last_heartbeat_timestamp and self.last_heartbeat_timestamp < time.time() - MASTER_HEARTBEAT_TIMEOUT:
                 logger.error(f"Didn't get heartbeat from master in over {MASTER_HEARTBEAT_TIMEOUT}s")
                 self.quit()
@@ -1352,17 +1415,17 @@ class WorkerRunner(DistributedRunner):
         except RPCError as e:
             logger.error(f"Temporary failure when resetting connection: {e}, will retry later.")
 
-    def worker(self) -> NoReturn:
+    async def worker(self) -> NoReturn:
         self.last_received_spawn_timestamp = 0
         while True:
             try:
-                msg = self.client.recv()
+                msg = await asyncio.to_thread(self.client.recv)
             except RPCError as e:
                 logger.error(f"RPCError found when receiving from master: {e}")
             else:
-                self.handle_message(msg)
+                await self.handle_message(msg)
 
-    def handle_message(self, msg: Message) -> None:
+    async def handle_message(self, msg: Message) -> None:
         match msg.type:
             case "ack":
                 # backward-compatible support of masters that do not send a worker index
@@ -1370,7 +1433,7 @@ class WorkerRunner(DistributedRunner):
                     self.worker_index = msg.data["index"]
                 self.connection_event.set()
             case "spawn":
-                self.client.send(Message("spawning", None, self.client_id))
+                await asyncio.to_thread(self.client.send, Message("spawning", None, self.client_id))
                 job = msg.data
                 if job["timestamp"] <= self.last_received_spawn_timestamp:
                     logger.info(
@@ -1404,29 +1467,33 @@ class WorkerRunner(DistributedRunner):
 
                 self.worker_state = STATE_SPAWNING
 
-                if self.spawning_greenlet:
-                    # kill existing spawning greenlet before we launch new one
-                    self.spawning_greenlet.kill(block=True)
-                self.spawning_greenlet = self.greenlet.spawn(lambda: self.start_worker(job["user_classes_count"]))
-                self.spawning_greenlet.link_exception(locust_exception_handler(self.environment))
+                if self.spawning_task and not self.spawning_task.done():
+                    # cancel existing spawning task before we launch new one
+                    self.spawning_task.cancel()
+                    try:
+                        await self.spawning_task
+                    except asyncio.CancelledError:
+                        pass
+                self.spawning_task = asyncio.create_task(self.start_worker(job["user_classes_count"]))
+                self.spawning_task.add_done_callback(locust_exception_handler(self.environment))
                 self.last_received_spawn_timestamp = job["timestamp"]
             case "stop":
-                self.stop()
-                self.client.send(Message("client_stopped", None, self.client_id))
+                await self.stop()
+                await asyncio.to_thread(self.client.send, Message("client_stopped", None, self.client_id))
                 # +additional_wait is just a small buffer to account for the random network latencies and/or other
                 # random delays inherent to distributed systems.
                 additional_wait = int(os.getenv("LOCUST_WORKER_ADDITIONAL_WAIT_BEFORE_READY_AFTER_STOP", 0))
-                gevent.sleep(self.environment.stop_timeout + additional_wait)
-                self.client.send(Message("client_ready", __version__, self.client_id))
+                await asyncio.sleep((self.environment.stop_timeout or 0) + additional_wait)
+                await asyncio.to_thread(self.client.send, Message("client_ready", __version__, self.client_id))
                 self.worker_state = STATE_INIT
             case "quit":
                 logger.info("Got quit message from master, shutting down...")
-                self.stop()
+                await self.stop()
                 self._send_stats()  # send a final report, in case there were any samples not yet reported
-                self.greenlet.kill(block=True)
+                await self._cancel_background_tasks()
             case "reconnect":
                 logger.warning("Received reconnect message from master. Resetting RPC connection.")
-                self.reset_connection()
+                await asyncio.to_thread(self.reset_connection)
             case "heartbeat":
                 self.last_heartbeat_timestamp = time.time()
                 self.environment.events.heartbeat_received.fire(
@@ -1443,19 +1510,30 @@ class WorkerRunner(DistributedRunner):
                 if not concurrent:
                     listener(environment=self.environment, msg=msg)
                 else:
-                    gevent.spawn(listener, self.environment, msg)
+                    asyncio.create_task(asyncio.to_thread(listener, environment=self.environment, msg=msg))
             case _:
                 logger.warning(f"Unknown message type received: {msg.type}")
 
-    def stats_reporter(self) -> NoReturn:
+    async def _cancel_background_tasks(self) -> None:
+        """Cancel all background tasks"""
+        tasks = [
+            self._worker_task, self._heartbeat_task, self._heartbeat_timeout_task,
+            self._stats_reporter_task, self._logs_reporter_task
+        ]
+        for task in tasks:
+            if task and not task.done():
+                task.cancel()
+        await asyncio.gather(*[t for t in tasks if t], return_exceptions=True)
+
+    async def stats_reporter(self) -> NoReturn:
         while True:
             try:
-                self._send_stats()
+                await asyncio.to_thread(self._send_stats)
             except RPCError as e:
                 logger.error(f"Temporary connection lost to master server: {e}, will retry later.")
-            gevent.sleep(WORKER_REPORT_INTERVAL)
+            await asyncio.sleep(WORKER_REPORT_INTERVAL)
 
-    def logs_reporter(self) -> None:
+    async def logs_reporter(self) -> None:
         if WORKER_LOG_REPORT_INTERVAL < 0:
             return
 
@@ -1472,7 +1550,7 @@ class WorkerRunner(DistributedRunner):
                 self._send_logs(current_logs)
 
             self.logs = current_logs
-            gevent.sleep(WORKER_LOG_REPORT_INTERVAL)
+            await asyncio.sleep(WORKER_LOG_REPORT_INTERVAL)
 
     def send_message(self, msg_type: str, data: dict[str, Any] | None = None, client_id: str | None = None) -> None:
         """
@@ -1493,27 +1571,6 @@ class WorkerRunner(DistributedRunner):
     def _send_logs(self, current_logs) -> None:
         self.send_message("logs", {"worker_id": self.client_id, "logs": current_logs})
 
-    def connect_to_master(self):
-        self.retry += 1
-        self.client.send(Message("client_ready", __version__, self.client_id))
-        try:
-            success = self.connection_event.wait(timeout=CONNECT_TIMEOUT)
-        except KeyboardInterrupt:
-            # dont complain about getting CTRL-C
-            sys.exit(1)
-        if not success:
-            if self.retry < 30 / CONNECT_TIMEOUT:  # lower log level during the first 30 seconds
-                logger.debug(
-                    f"Failed to connect to master {self.master_host}:{self.master_port}{self.web_base_path}, retry {self.retry}/{CONNECT_RETRY_COUNT}."
-                )
-            else:
-                logger.info(
-                    f"Failed to connect to master {self.master_host}:{self.master_port}{self.web_base_path}, retry {self.retry}/{CONNECT_RETRY_COUNT}."
-                )
-            if self.retry > CONNECT_RETRY_COUNT:
-                raise ConnectionError()
-            self.connect_to_master()
-        self.connected = True
 
 
 def _format_user_classes_count_for_log(user_classes_count: dict[str, int]) -> str:

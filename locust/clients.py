@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from locust.event import EventHook
 
+import asyncio
 import os
 import re
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 from typing import TYPE_CHECKING, cast
 from urllib.parse import urlparse, urlunparse
 
@@ -130,17 +131,16 @@ class HttpSession(requests.Session):
         else:
             return f"{self.base_url}{path}"
 
-    @contextmanager
-    def rename_request(self, name: str) -> Generator[None]:
-        """Group requests using the "with" keyword"""
-
+    @asynccontextmanager
+    async def rename_request(self, name: str):
+        """Group requests using the "async with" keyword"""
         self.request_name = name
         try:
             yield
         finally:
             self.request_name = None
 
-    def request(  # type: ignore[override]
+    async def request(  # type: ignore[override]
         self,
         method: str | bytes,
         url: str | bytes,
@@ -200,7 +200,10 @@ class HttpSession(requests.Session):
 
         start_time = time.time()
         start_perf_counter = time.perf_counter()
-        response = self._send_request_safe_mode(method, complete_url, data=data, json=json, **kwargs)
+        # run the synchronous request in a thread pool
+        response = await asyncio.to_thread(
+            self._send_request_safe_mode, method, complete_url, data=data, json=json, **kwargs
+        )
         response_time = (time.perf_counter() - start_perf_counter) * 1000
 
         if request_before_redirect := (response.history and response.history[0] or response).request:
@@ -260,14 +263,14 @@ class HttpSession(requests.Session):
             prep._explicit_name = self.explicit_name  # type: ignore
         return prep
 
-    def get(
+    async def get(
         self, url: str | bytes, *, data: Any = None, json: Any = None, **kwargs: Unpack[RESTKwargs]
     ) -> ResponseContextManager:
         """Sends a GET request"""
         kwargs.setdefault("allow_redirects", True)
-        return self.request("GET", url, data=data, json=json, **kwargs)
+        return await self.request("GET", url, data=data, json=json, **kwargs)
 
-    def options(
+    async def options(
         self,
         url: str | bytes,
         *,
@@ -277,9 +280,9 @@ class HttpSession(requests.Session):
     ) -> ResponseContextManager:
         """Sends a OPTIONS request"""
         kwargs.setdefault("allow_redirects", True)
-        return self.request("OPTIONS", url, data=data, json=json, **kwargs)
+        return await self.request("OPTIONS", url, data=data, json=json, **kwargs)
 
-    def head(
+    async def head(
         self,
         url: str | bytes,
         *,
@@ -289,9 +292,9 @@ class HttpSession(requests.Session):
     ) -> ResponseContextManager:
         """Sends a HEAD request"""
         kwargs.setdefault("allow_redirects", False)
-        return self.request("HEAD", url, data=data, json=json, **kwargs)
+        return await self.request("HEAD", url, data=data, json=json, **kwargs)
 
-    def post(
+    async def post(
         self,
         url: str | bytes,
         data: Any = None,
@@ -299,9 +302,9 @@ class HttpSession(requests.Session):
         **kwargs: Unpack[RESTKwargs],
     ) -> ResponseContextManager:
         """Sends a POST request"""
-        return self.request("POST", url, data=data, json=json, **kwargs)
+        return await self.request("POST", url, data=data, json=json, **kwargs)
 
-    def put(
+    async def put(
         self,
         url: str | bytes,
         data: Any = None,
@@ -310,9 +313,9 @@ class HttpSession(requests.Session):
         **kwargs: Unpack[RESTKwargs],
     ) -> ResponseContextManager:
         """Sends a PUT request"""
-        return self.request("PUT", url, data=data, json=json, **kwargs)
+        return await self.request("PUT", url, data=data, json=json, **kwargs)
 
-    def patch(
+    async def patch(
         self,
         url: str | bytes,
         data: Any = None,
@@ -321,9 +324,9 @@ class HttpSession(requests.Session):
         **kwargs: Unpack[RESTKwargs],
     ) -> ResponseContextManager:
         """Sends a PATCH request"""
-        return self.request("PATCH", url, data=data, json=json, **kwargs)
+        return await self.request("PATCH", url, data=data, json=json, **kwargs)
 
-    def delete(
+    async def delete(
         self,
         url: str | bytes,
         *,
@@ -332,7 +335,7 @@ class HttpSession(requests.Session):
         **kwargs: Unpack[RESTKwargs],
     ) -> ResponseContextManager:
         """Sends a DELETE request"""
-        return self.request("DELETE", url, data=data, json=json, **kwargs)
+        return await self.request("DELETE", url, data=data, json=json, **kwargs)
 
 
 class ResponseContextManager(Response):

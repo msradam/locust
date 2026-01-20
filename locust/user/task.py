@@ -9,6 +9,8 @@ from locust.exception import (
     StopUser,
 )
 
+import asyncio
+import inspect
 import logging
 import random
 import traceback
@@ -23,9 +25,6 @@ from typing import (
     overload,
     runtime_checkable,
 )
-
-import gevent
-from gevent import GreenletExit
 
 if TYPE_CHECKING:
     from locust import User
@@ -330,21 +329,35 @@ class TaskSet(metaclass=TaskSetMeta):
 
     def on_start(self) -> None:
         """
-        Called when a User starts executing this TaskSet
+        Called when a User starts executing this TaskSet.
+        Can be either sync or async.
         """
         pass
 
     def on_stop(self):
         """
         Called when a User stops executing this TaskSet. E.g. when TaskSet.interrupt() is called
-        or when the User is killed
+        or when the User is killed.
+        Can be either sync or async.
         """
         pass
 
+    async def _call_on_start(self):
+        """Call on_start, handling both sync and async implementations"""
+        result = self.on_start()
+        if inspect.iscoroutine(result):
+            await result
+
+    async def _call_on_stop(self):
+        """Call on_stop, handling both sync and async implementations"""
+        result = self.on_stop()
+        if inspect.iscoroutine(result):
+            await result
+
     @final
-    def run(self):
+    async def run(self):
         try:
-            self.on_start()
+            await self._call_on_start()
         except InterruptTaskSet as e:
             if e.reschedule:
                 raise RescheduleTaskImmediately(e.reschedule).with_traceback(e.__traceback__)
@@ -359,17 +372,17 @@ class TaskSet(metaclass=TaskSetMeta):
                 try:
                     if self.user._state == LOCUST_STATE_STOPPING:
                         raise StopUser()
-                    self.execute_next_task()
+                    await self.execute_next_task()
                 except RescheduleTaskImmediately:
                     pass
                 except RescheduleTask:
-                    self.wait()
+                    await self.wait()
                 else:
-                    self.wait()
+                    await self.wait()
             except InterruptTaskSet as e:
                 try:
-                    self.on_stop()
-                except (StopUser, StopTest, GreenletExit):
+                    await self._call_on_stop()
+                except (StopUser, StopTest, asyncio.CancelledError):
                     raise
                 except Exception:
                     logging.error("Uncaught exception in on_stop: \n%s", traceback.format_exc())
@@ -377,9 +390,9 @@ class TaskSet(metaclass=TaskSetMeta):
                     raise RescheduleTaskImmediately(e.reschedule) from e
                 else:
                     raise RescheduleTask(e.reschedule) from e
-            except (StopUser, StopTest, GreenletExit):
+            except (StopUser, StopTest, asyncio.CancelledError):
                 try:
-                    self.on_stop()
+                    await self._call_on_stop()
                 except Exception:
                     logging.error("Uncaught exception in on_stop: \n%s", traceback.format_exc())
                 raise
@@ -387,24 +400,28 @@ class TaskSet(metaclass=TaskSetMeta):
                 self.user.environment.events.user_error.fire(user_instance=self, exception=e, tb=e.__traceback__)
                 if self.user.environment.catch_exceptions:
                     logger.error("%s\n%s", e, traceback.format_exc())
-                    self.wait()
+                    await self.wait()
                 else:
                     raise
 
-    def execute_next_task(self):
-        self.execute_task(self._task_queue.popleft())
+    async def execute_next_task(self):
+        await self.execute_task(self._task_queue.popleft())
 
-    def execute_task(self, task):
+    async def execute_task(self, task):
         # check if the function is a method bound to the current locust, and if so, don't pass self as first argument
         if hasattr(task, "__self__") and task.__self__ == self:
             # task is a bound method on self
-            task()
+            result = task()
+            if inspect.iscoroutine(result):
+                await result
         elif hasattr(task, "tasks") and issubclass(task, TaskSet):
             # task is another (nested) TaskSet class
-            task(self).run()
+            await task(self).run()
         else:
             # task is a function
-            task(self)
+            result = task(self)
+            if inspect.iscoroutine(result):
+                await result
 
     def schedule_task(self, task_callable, first=False):
         """
@@ -448,7 +465,7 @@ class TaskSet(metaclass=TaskSetMeta):
                 "You must define a wait_time method on either the {type(self.user).__name__} or {type(self).__name__} class"
             )
 
-    def wait(self):
+    async def wait(self):
         """
         Make the running user sleep for a duration defined by the Locust.wait_time
         function (or TaskSet.wait_time function if it's been defined).
@@ -456,18 +473,18 @@ class TaskSet(metaclass=TaskSetMeta):
         The user can also be killed gracefully while it's sleeping, so calling this
         method within a task makes it possible for a user to be killed mid-task, even if you've
         set a stop_timeout. If this behaviour is not desired you should make the user wait using
-        gevent.sleep() instead.
+        asyncio.sleep() instead.
         """
         if self.user._state == LOCUST_STATE_STOPPING:
             raise StopUser()
         self.user._state = LOCUST_STATE_WAITING
-        self._sleep(self.wait_time())
+        await self._sleep(self.wait_time())
         if self.user._state == LOCUST_STATE_STOPPING:
             raise StopUser()
         self.user._state = LOCUST_STATE_RUNNING
 
-    def _sleep(self, seconds):
-        gevent.sleep(seconds)
+    async def _sleep(self, seconds):
+        await asyncio.sleep(seconds)
 
     def interrupt(self, reschedule=True):
         """
@@ -503,10 +520,12 @@ class DefaultTaskSet(TaskSet):
             )
         return random.choice(self.user.tasks)
 
-    def execute_task(self, task):
+    async def execute_task(self, task):
         if hasattr(task, "tasks") and issubclass(task, TaskSet):
-            # task is  (nested) TaskSet class
-            task(self.user).run()
+            # task is (nested) TaskSet class
+            await task(self.user).run()
         else:
             # task is a function
-            task(self.user)
+            result = task(self.user)
+            if inspect.iscoroutine(result):
+                await result

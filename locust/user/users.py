@@ -13,6 +13,8 @@ from locust.user.task import (
 from locust.user.wait_time import constant
 from locust.util import deprecation
 
+import asyncio
+import inspect
 import logging
 import sys
 import time
@@ -20,9 +22,6 @@ import traceback
 from collections.abc import Callable
 from typing import TYPE_CHECKING, final
 
-from gevent import GreenletExit, greenlet
-from gevent.pool import Group
-from geventhttpclient.useragent import ConnectionError
 from requests.exceptions import RequestException
 from urllib3 import PoolManager
 
@@ -133,42 +132,52 @@ class User(metaclass=UserMeta):
         self.environment = environment
         """A reference to the :py:class:`Environment <locust.env.Environment>` in which this user is running"""
         self._state: str | None = None
-        self._greenlet: greenlet.Greenlet | None = None
-        self._group: Group
+        self._task: asyncio.Task | None = None
         self._taskset_instance: TaskSet | None = None
         self._cp_last_run = time.time()  # used by constant_pacing wait_time
 
     def on_start(self) -> None:
         """
         Called when a User starts running.
+        Can be either sync or async.
         """
         pass
 
     def on_stop(self):
         """
-        Called when a User stops running (is killed)
+        Called when a User stops running (is killed).
+        Can be either sync or async.
         """
         pass
 
+    async def _call_on_start(self):
+        """Call on_start, handling both sync and async implementations"""
+        result = self.on_start()
+        if inspect.iscoroutine(result):
+            await result
+
+    async def _call_on_stop(self):
+        """Call on_stop, handling both sync and async implementations"""
+        result = self.on_stop()
+        if inspect.iscoroutine(result):
+            await result
+
     @final
-    def run(self):
+    async def run(self):
         self._state = LOCUST_STATE_RUNNING
         self._taskset_instance = DefaultTaskSet(self)
         try:
-            # run the User on_start method, if it has one
             try:
-                self.on_start()
+                await self._call_on_start()
             except Exception as e:
-                # unhandled exceptions inside tasks are logged in TaskSet.run, but since we're not yet there...
                 logger.error("%s\n%s", e, traceback.format_exc())
                 raise
 
-            self._taskset_instance.run()
-        except (GreenletExit, StopUser, StopTest):
-            # run the on_stop method, if it has one
-            self.on_stop()
+            await self._taskset_instance.run()
+        except (asyncio.CancelledError, StopUser, StopTest):
+            await self._call_on_stop()
 
-    def wait(self):
+    async def wait(self):
         """
         Make the running user sleep for a duration defined by the User.wait_time
         function.
@@ -176,42 +185,31 @@ class User(metaclass=UserMeta):
         The user can also be killed gracefully while it's sleeping, so calling this
         method within a task makes it possible for a user to be killed mid-task even if you've
         set a stop_timeout. If this behaviour is not desired, you should make the user wait using
-        gevent.sleep() instead.
+        asyncio.sleep() instead.
         """
-        self._taskset_instance.wait()
+        await self._taskset_instance.wait()
 
-    def start(self, group: Group):
+    def start(self, task_group: asyncio.TaskGroup) -> asyncio.Task:
         """
-        Start a greenlet that runs this User instance.
+        Start an asyncio task that runs this User instance.
 
-        :param group: Group instance where the greenlet will be spawned.
-        :type group: gevent.pool.Group
-        :returns: The spawned greenlet.
+        :param task_group: TaskGroup instance where the task will be created.
+        :returns: The created task.
         """
-
-        def run_user(user):
-            """
-            Main function for User greenlet. It's important that this function takes the user
-            instance as an argument, since we use greenlet_instance.args[0] to retrieve a reference to the
-            User instance.
-            """
-            user.run()
-
-        self._greenlet = group.spawn(run_user, self)
-        self._group = group
-        return self._greenlet
+        self._task = task_group.create_task(self.run())
+        return self._task
 
     def stop(self, force: bool = False):
         """
-        Stop the user greenlet.
+        Stop the user task.
 
         :param force: If False (the default) the stopping is done gracefully by setting the state to LOCUST_STATE_STOPPING
                       which will make the User instance stop once any currently running task is complete and on_stop
-                      methods are called. If force is True the greenlet will be killed immediately.
-        :returns: True if the greenlet was killed immediately, otherwise False
+                      methods are called. If force is True the task will be cancelled immediately.
+        :returns: True if the task was cancelled immediately, otherwise False
         """
         if force or self._state == LOCUST_STATE_WAITING:
-            self._group.killone(self._greenlet)
+            self._task.cancel()
             return True
         elif self._state == LOCUST_STATE_RUNNING:
             self._state = LOCUST_STATE_STOPPING
@@ -220,12 +218,8 @@ class User(metaclass=UserMeta):
             raise Exception(f"Tried to stop User in an unexpected state: {self._state}. This should never happen.")
 
     @property
-    def group(self):
-        return self._group
-
-    @property
-    def greenlet(self):
-        return self._greenlet
+    def task(self):
+        return self._task
 
     def context(self) -> dict:
         """
@@ -306,5 +300,5 @@ class PytestUser(User):
                     logger.debug("%s\n%s", e, traceback.format_exc())
                 except CatchResponseError as e:
                     logger.debug("%s\n%s", e, traceback.format_exc())
-                except ConnectionError as e:
+                except OSError as e:  # includes ConnectionError
                     logger.debug("%s\n%s", e, traceback.format_exc())

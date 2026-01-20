@@ -26,7 +26,9 @@ else:
     import tomli as tomllib
 
 import configargparse
-import gevent
+import asyncio
+import threading
+import time as time_module
 import requests
 
 from .util.directory import get_abspaths_in
@@ -263,35 +265,41 @@ See documentation for more details, including how to set options using a file or
 def download_locustfile_from_master(master_host: str, master_port: int) -> str:
     client_id = socket.gethostname() + "_download_locustfile_" + uuid4().hex
     tempclient = zmqrpc.Client(master_host, master_port, client_id)
-    got_reply = False
+    got_reply = threading.Event()
+    msg_result = [None]
+    timeout_seconds = runners.CONNECT_TIMEOUT * runners.CONNECT_RETRY_COUNT
 
     def ask_for_locustfile():
-        while not got_reply:
+        while not got_reply.is_set():
             tempclient.send(Message("locustfile", {"version": version}, client_id))
-            gevent.sleep(1)
+            time_module.sleep(1)
 
     def log_warning():
-        gevent.sleep(10)
-        while not got_reply:
+        time_module.sleep(10)
+        while not got_reply.is_set():
             sys.stderr.write("Waiting to connect to master to receive locustfile...\n")
-            gevent.sleep(60)
+            time_module.sleep(60)
 
     def wait_for_reply():
-        return tempclient.recv()
+        msg_result[0] = tempclient.recv()
+        got_reply.set()
 
-    gevent.spawn(ask_for_locustfile)
-    gevent.spawn(log_warning)
+    ask_thread = threading.Thread(target=ask_for_locustfile, daemon=True)
+    warn_thread = threading.Thread(target=log_warning, daemon=True)
+    recv_thread = threading.Thread(target=wait_for_reply, daemon=True)
 
-    try:
-        # wait same time as for client_ready ack. not that it is really relevant...
-        msg = gevent.spawn(wait_for_reply).get(timeout=runners.CONNECT_TIMEOUT * runners.CONNECT_RETRY_COUNT)
-        got_reply = True
-    except gevent.Timeout:
+    ask_thread.start()
+    warn_thread.start()
+    recv_thread.start()
+
+    # wait for reply with timeout
+    if not got_reply.wait(timeout=timeout_seconds):
         sys.stderr.write(
-            f"Got no locustfile response from master, gave up after {runners.CONNECT_TIMEOUT * runners.CONNECT_RETRY_COUNT}s\n"
+            f"Got no locustfile response from master, gave up after {timeout_seconds}s\n"
         )
         sys.exit(1)
 
+    msg = msg_result[0]
     if msg.type != "locustfile":
         sys.stderr.write(f"Got wrong message type from master {msg.type}\n")
         sys.exit(1)

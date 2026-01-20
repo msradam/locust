@@ -14,7 +14,7 @@ from copy import copy
 from itertools import chain
 from typing import TYPE_CHECKING, Protocol, TypedDict, TypeVar, cast
 
-import gevent
+import time
 
 from .exception import CatchResponseError
 from .util.date import format_utc_timestamp
@@ -894,11 +894,10 @@ def get_error_report_summary(stats) -> list[str]:
 
 
 def stats_printer(stats: RequestStats) -> Callable[[], None]:
+    """Returns a function that prints stats once when called"""
     def stats_printer_func() -> None:
         try:
-            while True:
-                print_stats(stats)
-                gevent.sleep(CONSOLE_STATS_INTERVAL_SEC)
+            print_stats(stats)
         except KeyboardInterrupt as e:
             logger.debug(e, exc_info=True)
 
@@ -934,14 +933,11 @@ def update_stats_history(runner: Runner, timestamp: str | None = None) -> None:
 def stats_history(runner: Runner) -> None:
     """Save current stats info to history for charts of report."""
     try:
-        while True:
-            if not runner.stats.total.use_response_times_cache:
-                break
+        if not runner.stats.total.use_response_times_cache:
+            return
 
-            if runner.state != "ready" and runner.state != "stopped":
-                update_stats_history(runner)
-
-            gevent.sleep(HISTORY_STATS_INTERVAL_SEC)
+        if runner.state != "ready" and runner.state != "stopped":
+            update_stats_history(runner)
     except KeyboardInterrupt as e:
         logger.debug(e, exc_info=True)
 
@@ -1109,34 +1105,35 @@ class StatsCSVFileWriter(StatsCSV):
         self.exceptions_csv_writer.writerow(self.exceptions_columns)
         self.exceptions_csv_data_start = self.exceptions_csv_filehandle.tell()
 
-        # Continuously write date rows for all files
-        last_flush_time: float = 0.0
+        # Write stats rows once per call (called periodically from main loop)
+        self._requests_csv_data_start = requests_csv_data_start
+        self._last_flush_time: float = 0.0
+
+    def stats_writer(self) -> None:
+        """Write stats once - called periodically from main event loop"""
         try:
-            while True:
-                now = time.time()
+            now = time.time()
 
-                self.requests_csv_filehandle.seek(requests_csv_data_start)
-                self._requests_data_rows(self.requests_csv_writer)
-                self.requests_csv_filehandle.truncate()
+            self.requests_csv_filehandle.seek(self._requests_csv_data_start)
+            self._requests_data_rows(self.requests_csv_writer)
+            self.requests_csv_filehandle.truncate()
 
-                self._stats_history_data_rows(self.stats_history_csv_writer, now)
+            self._stats_history_data_rows(self.stats_history_csv_writer, now)
 
-                self.failures_csv_filehandle.seek(self.failures_csv_data_start)
-                self._failures_data_rows(self.failures_csv_writer)
-                self.failures_csv_filehandle.truncate()
+            self.failures_csv_filehandle.seek(self.failures_csv_data_start)
+            self._failures_data_rows(self.failures_csv_writer)
+            self.failures_csv_filehandle.truncate()
 
-                self.exceptions_csv_filehandle.seek(self.exceptions_csv_data_start)
-                self._exceptions_data_rows(self.exceptions_csv_writer)
-                self.exceptions_csv_filehandle.truncate()
+            self.exceptions_csv_filehandle.seek(self.exceptions_csv_data_start)
+            self._exceptions_data_rows(self.exceptions_csv_writer)
+            self.exceptions_csv_filehandle.truncate()
 
-                if now - last_flush_time > CSV_STATS_FLUSH_INTERVAL_SEC:
-                    self.requests_flush()
-                    self.stats_history_flush()
-                    self.failures_flush()
-                    self.exceptions_flush()
-                    last_flush_time = now
-
-                gevent.sleep(CSV_STATS_INTERVAL_SEC)
+            if now - self._last_flush_time > CSV_STATS_FLUSH_INTERVAL_SEC:
+                self.requests_flush()
+                self.stats_history_flush()
+                self.failures_flush()
+                self.exceptions_flush()
+                self._last_flush_time = now
         except KeyboardInterrupt as e:
             logger.debug(e, exc_info=True)
 

@@ -10,19 +10,10 @@ if os.getenv("LOCUST_PLAYWRIGHT", None):
         # dont show a massive callstack if trio is not installed
         os._exit(1)
 
-if not os.getenv("LOCUST_SKIP_MONKEY_PATCH", None):
-    from gevent import monkey, queue
-
-    monkey.patch_all()
-
-    if not os.getenv("LOCUST_SKIP_URLLIB3_PATCH", None):
-        import urllib3
-
-        urllib3.connectionpool.ConnectionPool.QueueCls = queue.LifoQueue
-        # https://github.com/locustio/locust/issues/2812
+# asyncio port: monkey patching removed - this version uses native asyncio
 
 from ._version import version as __version__
-from .contrib.fasthttp import FastHttpUser
+# FastHttpUser removed - requires geventhttpclient which is not compatible with asyncio
 from .debug import run_single_user
 from .event import Events
 from .shape import LoadTestShape
@@ -45,7 +36,6 @@ __all__ = (
     "tag",
     "TaskSet",
     "HttpUser",
-    "FastHttpUser",
     "User",
     "between",
     "constant",

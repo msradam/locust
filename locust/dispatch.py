@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import itertools
 import math
@@ -10,8 +11,6 @@ from heapq import heapify, heapreplace
 from math import log2
 from operator import attrgetter
 from typing import TYPE_CHECKING
-
-import gevent
 
 if TYPE_CHECKING:
     from locust import User
@@ -286,7 +285,9 @@ class UsersDispatcher(Iterator):
             return
 
         sleep_duration = max(0.0, self._wait_between_dispatch - delta)
-        gevent.sleep(sleep_duration)
+        # use time.sleep since this is called from synchronous iterator context
+        # the runner will call this from an async context using asyncio.to_thread if needed
+        time.sleep(sleep_duration)
 
     def _add_users_on_workers(self) -> dict[str, dict[str, int]]:
         """Add users on the workers until the target number of users is reached for the current dispatch iteration

@@ -3,6 +3,7 @@ from __future__ import annotations
 import locust
 from locust.opentelemetry import setup_opentelemetry
 
+import asyncio
 import atexit
 import errno
 import gc
@@ -17,8 +18,6 @@ import traceback
 import webbrowser
 from typing import TYPE_CHECKING
 
-import gevent
-
 from . import log, stats
 from .argument_parser import (
     get_locustfiles_locally,
@@ -28,7 +27,7 @@ from .argument_parser import (
 from .env import Environment
 from .html import get_html_report, process_html_filename
 from .input_events import input_listener
-from .log import greenlet_exception_logger, setup_logging
+from .log import setup_logging
 from .user.inspectuser import print_task_ratio, print_task_ratio_json
 from .util.load_locustfile import load_locustfile, load_locustfile_pytest
 
@@ -210,7 +209,7 @@ def main():
         if hasattr(gc, "freeze"):
             gc.freeze()  # move all objects to perm gen so ref counts dont get updated
         for _ in range(options.processes):
-            if child_pid := gevent.fork():
+            if child_pid := os.fork():
                 children.append(child_pid)
                 logging.debug(f"Started child worker with pid #{child_pid}")
             else:
@@ -287,8 +286,6 @@ def main():
                     time.sleep(0.1)
 
                 atexit.register(kill_workers, children)
-
-    greenlet_exception_handler = greenlet_exception_logger(logger)
 
     if options.list_commands:
         print("Available Users:")
@@ -414,8 +411,10 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
     else:
         runner = environment.create_local_runner()
 
-    # main_greenlet is pointing to runners.greenlet by default, it will point the web greenlet later if in web mode
-    main_greenlet = runner.greenlet
+    # main event loop and shutdown flag
+    main_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(main_loop)
+    shutdown_event = asyncio.Event()
 
     if options.run_time:
         if options.worker:
@@ -490,15 +489,14 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
 
     if web_ui:
         web_ui.start()
-        main_greenlet = web_ui.greenlet
 
-    def stop_and_optionally_quit():
+    async def stop_and_optionally_quit():
         if options.autostart and not options.headless:
             logger.info("--run-time limit reached, stopping test")
-            runner.stop()
+            await runner.stop()
             if options.autoquit != -1:
                 logger.debug(f"Autoquit time limit set to {options.autoquit} seconds")
-                time.sleep(options.autoquit)
+                await asyncio.sleep(options.autoquit)
                 logger.info("--autoquit time reached, shutting down")
                 runner.quit()
                 if web_ui:
@@ -508,21 +506,38 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
         else:  # --headless run
             logger.info("--run-time limit reached, shutting down")
             runner.quit()
+        shutdown_event.set()
 
-    def spawn_run_time_quit_greenlet():
-        gevent.spawn_later(options.run_time, stop_and_optionally_quit).link_exception(greenlet_exception_handler)
+    async def spawn_run_time_quit_task():
+        await asyncio.sleep(options.run_time)
+        await stop_and_optionally_quit()
 
-    headless_master_greenlet = None
-    stats_printer_greenlet = None
+    stats_printer_task = None
     if not options.only_summary and (options.print_stats or (options.headless and not options.worker)):
-        # spawn stats printing greenlet
-        stats_printer_greenlet = gevent.spawn(stats.stats_printer(runner.stats))
-        stats_printer_greenlet.link_exception(greenlet_exception_handler)
+        # spawn stats printing task
+        async def stats_printer_loop():
+            printer = stats.stats_printer(runner.stats)
+            while True:
+                try:
+                    printer()
+                except StopIteration:
+                    break
+                await asyncio.sleep(2)
+        stats_printer_task = main_loop.create_task(stats_printer_loop())
 
-    gevent.spawn(stats.stats_history, runner)
+    # stats history task
+    stats_history_task = None
 
-    def start_automatic_run():
+    async def stats_history_loop():
+        while True:
+            stats.stats_history(runner)
+            await asyncio.sleep(5)
+    stats_history_task = main_loop.create_task(stats_history_loop())
+
+    async def start_automatic_run():
         if options.master:
+            # start background tasks for master
+            runner.start_background_tasks()
             # wait for worker nodes to connect
             start_time = time.monotonic()
             while len(runner.clients.ready) < options.expect_workers:
@@ -542,10 +557,11 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
                         len(runner.clients.ready),
                         options.expect_workers,
                     )
-                # TODO: Handle KeyboardInterrupt and send quit signal to workers that are started.
-                #       Right now, if the user sends a ctrl+c, the master will not gracefully
-                #       shutdown resulting in all the already started workers to stay active.
-                time.sleep(1)
+                await asyncio.sleep(1)
+        elif options.worker:
+            # start background tasks for worker
+            runner.start_background_tasks()
+            await runner.connect_to_master_async()
         if not options.worker:
             # apply headless mode defaults
             if options.num_users is None:
@@ -556,67 +572,95 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
             # start the test
             if environment.shape_class:
                 try:
-                    environment.runner.start_shape()
-                    environment.runner.shape_greenlet.join()
+                    runner.start_shape()
+                    # wait for shape task to complete
+                    if runner.shape_task:
+                        await runner.shape_task
+                except asyncio.CancelledError:
+                    logging.info("Exiting due to cancellation")
                 except KeyboardInterrupt:
                     logging.info("Exiting due to CTRL+C interruption")
                 finally:
-                    stop_and_optionally_quit()
+                    await stop_and_optionally_quit()
             else:
-                headless_master_greenlet = gevent.spawn(runner.start, options.num_users, options.spawn_rate)
-                headless_master_greenlet.link_exception(greenlet_exception_handler)
+                await runner.start(options.num_users, options.spawn_rate)
 
             if options.run_time:
                 logger.info(f"Run time limit set to {options.run_time} seconds")
-                spawn_run_time_quit_greenlet()
+                main_loop.create_task(spawn_run_time_quit_task())
             elif not environment.shape_class:
                 logger.info("No run time limit set, use CTRL+C to interrupt")
 
     if options.csv_prefix:
-        gevent.spawn(stats_csv_writer.stats_writer).link_exception(greenlet_exception_handler)
+        async def stats_writer_loop():
+            while True:
+                stats_csv_writer.stats_writer()
+                await asyncio.sleep(stats.CSV_STATS_INTERVAL_SEC)
+        main_loop.create_task(stats_writer_loop())
     if options.stats_history_enabled and (options.csv_prefix is None):
         parser.error("'--csv-full-history' requires '--csv'.")
 
-    if options.headless:
-        start_automatic_run()
-
-    input_listener_greenlet = None
+    input_listener_task = None
     if not options.worker:
-        # spawn input listener greenlet
-        input_listener_greenlet = gevent.spawn(
-            input_listener(
+        # spawn input listener task
+        async def input_listener_loop():
+            def start_with_count(count):
+                if runner.state != "spawning":
+                    main_loop.create_task(runner.start(count, 100))
+                else:
+                    logging.warning("Already spawning users, can't spawn more right now")
+
+            def stop_with_count(count):
+                if runner.state != "spawning":
+                    main_loop.create_task(runner.start(count, 100))
+                else:
+                    logging.warning("Spawning users, can't stop right now")
+
+            listener = input_listener(
                 {
-                    "w": lambda: runner.start(runner.user_count + 1, 100)
-                    if runner.state != "spawning"
-                    else logging.warning("Already spawning users, can't spawn more right now"),
-                    "W": lambda: runner.start(runner.user_count + 10, 100)
-                    if runner.state != "spawning"
-                    else logging.warning("Already spawning users, can't spawn more right now"),
-                    "s": lambda: runner.start(max(0, runner.user_count - 1), 100)
-                    if runner.state != "spawning"
-                    else logging.warning("Spawning users, can't stop right now"),
-                    "S": lambda: runner.start(max(0, runner.user_count - 10), 100)
-                    if runner.state != "spawning"
-                    else logging.warning("Spawning users, can't stop right now"),
+                    "w": lambda: start_with_count(runner.user_count + 1),
+                    "W": lambda: start_with_count(runner.user_count + 10),
+                    "s": lambda: stop_with_count(max(0, runner.user_count - 1)),
+                    "S": lambda: stop_with_count(max(0, runner.user_count - 10)),
                     "\r": lambda: webbrowser.open_new_tab(url),
                     "\n": lambda: webbrowser.open_new_tab(url),
                 },
             )
-        )
-        input_listener_greenlet.link_exception(greenlet_exception_handler)
-        # ensure terminal is reset, even if there is an unhandled exception in locust or someone
-        # does something wild, like calling sys.exit() in the locustfile
-        atexit.register(input_listener_greenlet.kill, block=True)
+            # run the input listener in a thread to avoid blocking
+            await asyncio.to_thread(listener)
+        input_listener_task = main_loop.create_task(input_listener_loop())
+
+    async def shutdown_async():
+        """
+        Async shutdown - called while event loop is still running
+        """
+        logger.debug("Running teardowns...")
+
+        if input_listener_task is not None:
+            input_listener_task.cancel()
+
+        if stats_printer_task is not None:
+            stats_printer_task.cancel()
+            try:
+                await stats_printer_task
+            except asyncio.CancelledError:
+                pass
+
+        if stats_history_task is not None:
+            stats_history_task.cancel()
+            try:
+                await stats_history_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.debug("Cleaning up runner...")
+        if runner is not None:
+            await runner._quit_async()
 
     def shutdown():
         """
         Shut down locust by firing quitting event, printing/writing stats and exiting
         """
-        logger.debug("Running teardowns...")
-
-        if input_listener_greenlet is not None:
-            input_listener_greenlet.kill(block=False)
-
         environment.events.quitting.fire(environment=environment, reverse=True)
 
         # determine the process exit code
@@ -631,13 +675,6 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
 
         logger.info(f"Shutting down (exit code {code})")
 
-        if stats_printer_greenlet is not None:
-            stats_printer_greenlet.kill(block=False)
-        if headless_master_greenlet is not None:
-            headless_master_greenlet.kill(block=False)
-        logger.debug("Cleaning up runner...")
-        if runner is not None:
-            runner.quit()
         if options.json:
             stats.print_stats_json(runner.stats)
         if options.json_file:
@@ -650,9 +687,9 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
         sys.exit(code)
 
     # install SIGTERM handler
-    def sig_term_handler():
+    def sig_term_handler(_signum, _frame):
         logger.info("Got SIGTERM signal")
-        shutdown()
+        shutdown_event.set()
 
     def save_html_report():
         html_report = get_html_report(environment, show_download_link=False)
@@ -661,15 +698,19 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
         with open(options.html_file, "w", encoding="utf-8") as file:
             file.write(html_report)
 
-    gevent.signal_handler(signal.SIGTERM, sig_term_handler)
+    signal.signal(signal.SIGTERM, sig_term_handler)
 
-    try:
+    async def main_async():
         if options.class_picker:
             logger.debug("Locust is running with the UserClass Picker Enabled")
-        if options.autostart and not options.headless:
-            start_automatic_run()
+        if options.headless or (options.autostart and not options.headless):
+            await start_automatic_run()
 
-        main_greenlet.join()
+        # wait for shutdown signal
+        await shutdown_event.wait()
+
+    try:
+        main_loop.run_until_complete(main_async())
         if options.html_file:
             save_html_report()
     except KeyboardInterrupt:
@@ -677,4 +718,8 @@ See https://github.com/locustio/locust/wiki/Installation#increasing-maximum-numb
             save_html_report()
     except Exception:
         raise
+    finally:
+        # Run async shutdown while loop is still available
+        main_loop.run_until_complete(shutdown_async())
+        main_loop.close()
     shutdown()

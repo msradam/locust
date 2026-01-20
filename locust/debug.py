@@ -6,6 +6,7 @@ from locust import argument_parser
 from locust.env import Environment
 from locust.exception import CatchResponseError, RescheduleTask
 
+import asyncio
 import inspect
 import os
 from datetime import datetime, timezone
@@ -162,4 +163,4 @@ def run_single_user(
     # create a single user
     user = user_class(_env)
     setattr(_env, "single_user_instance", user)  # if you happen to need access to this from the Environment instance
-    user.run()
+    asyncio.run(user.run())
