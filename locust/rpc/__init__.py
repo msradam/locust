@@ -3,5 +3,9 @@ __all__ = (
     "rpc",
 )
 
-from . import zmqrpc as rpc
+try:
+    from . import zmqrpc as rpc
+except ImportError:
+    rpc = None  # type: ignore[assignment]  # ZMQ not available (e.g., on z/OS)
+
 from .protocol import Message

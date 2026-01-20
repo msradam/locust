@@ -5,8 +5,8 @@ import socket as csocket
 from socket import gaierror, has_dualstack_ipv6
 
 import msgpack.exceptions as msgerr
+import zmq
 import zmq.error as zmqerr
-import zmq.green as zmq
 
 from .protocol import Message
 

@@ -37,7 +37,7 @@ dependencies = [
     "Werkzeug>=2.0.0",
     "requests>=2.32.2",
     "msgpack>=1.0.0",
-    "pyzmq>=25.0.0",
+    "pyzmq>=25.0.0; sys_platform != 'zos'",
     "configargparse>=1.7.1",
     "tomli>=1.1.0; python_version < '3.11'",
     "typing_extensions>=4.6.0; python_version < '3.12'",

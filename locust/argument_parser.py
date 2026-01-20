@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import locust
 from locust import runners
-from locust.rpc import Message, zmqrpc
+from locust.rpc import Message, rpc as zmqrpc
 
 import argparse
 import ast
@@ -263,6 +263,8 @@ See documentation for more details, including how to set options using a file or
 
 
 def download_locustfile_from_master(master_host: str, master_port: int) -> str:
+    if zmqrpc is None:
+        raise ImportError("pyzmq is required for distributed mode but is not installed")
     client_id = socket.gethostname() + "_download_locustfile_" + uuid4().hex
     tempclient = zmqrpc.Client(master_host, master_port, client_id)
     got_reply = threading.Event()

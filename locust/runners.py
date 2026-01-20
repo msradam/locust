@@ -678,6 +678,8 @@ class MasterRunner(DistributedRunner):
         :param master_bind_host: Host/interface to use for incoming worker connections
         :param master_bind_port: Port to use for incoming worker connections
         """
+        if rpc is None:
+            raise ImportError("pyzmq is required for distributed mode but is not installed")
         super().__init__(environment)
         self.worker_cpu_warning_emitted = False
         self.master_bind_host = master_bind_host
@@ -1267,6 +1269,8 @@ class WorkerRunner(DistributedRunner):
         :param master_host: Host/IP to use for connection to the master
         :param master_port: Port to use for connecting to the master
         """
+        if rpc is None:
+            raise ImportError("pyzmq is required for distributed mode but is not installed")
         super().__init__(environment)
         self.retry = 0
         self.connected = False
